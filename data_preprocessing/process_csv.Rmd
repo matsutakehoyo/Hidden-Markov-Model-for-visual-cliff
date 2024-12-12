@@ -1,0 +1,447 @@
+---
+title: "process mouse label data"
+author: "Take Matsuyama"
+date: "2023/03/08"
+output: html_document
+editor_options: 
+   chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+   echo = FALSE,
+   message = FALSE,
+   warning = FALSE,
+   fig.align = "center",
+   out.width='95%',
+   out.height='95%'
+)
+```
+
+# Overview
+
+- 目的：
+visual cliff testを用いて、マウスの視覚機能の回復度合を段階的に評価できる指標の確率を本研究のゴールとする。
+
+- 実験材料：
+実験用マウス（C57BL/6J)、2cm角の白黒の正方形で構成されたチェッカーボードシート、アクリル板、実験台(高さ80cm）、直径60cm高さ36cmの円柱、LED照明、30fpsカメラ
+
+- 実験方法：
+実験装置の中央部にプラットフォームを置き、マウスがプラットフォームから降りてから一定時間（約60分）、マウスの動きをカメラで撮影した。
+
+- 解析：
+DeepLabCut によって首藤が体のパーツをラベリングした。Deeplabcut解析により出力された位置座標からRを用いて簡単に解析を行った。
+   
+
+このスクリプトでは
+
+- ラベルの信頼性を図示（bodyparts ごとに）
+- 同一個体の録画が複数動画に分割されているものを同じデータフレームに統合(trial を追加)
+- 部位のアライメントを可視化
+- データの境界を計算（マウスが十分に探索している仮定）
+- マウスの軌跡とヒートマップの可視化
+- 各記録データと実験条件の紐付け
+
+を行う。
+
+### 要件
+
+同フォルダーに一つ以上のcsvファイルがあり、ファイルのラベル情報（体の部位など）は同じであると仮定する。
+
+またこれらのcsvファイルの実験条件、マウスの性別の性、週齢、光条件、箱の大きさ、模様の大きさや濃淡、などを記したファイルが必要(experiment.xlsx)。
+
+```{r library-source}
+library(tidyverse)
+library(readxl)
+library(hexbin)
+library(magrittr)
+library(zoo)
+library(patchwork)
+library(wesanderson)
+library(MetBrewer)
+```
+
+# Read Data
+解析するファイルを確認する。
+
+```{r check-files}
+read_files <- function(f){
+  # f <- files[1]
+  names  <- readLines(f, n=2) %>% extract2(2) %>% strsplit( ",") %>% unlist()  %>% .[-1]
+   names <- paste0(c("x_", "y_", "likelihood_"), names)
+   names <- c("frame", names)
+   experiment <- read_excel("experiment.xlsx") %>% 
+      filter(file == f)
+   if (!nrow(experiment)) warning("experiment information is missing!")
+   d <- read_csv(f, col_names = names, skip = 3) %>% 
+      bind_cols(experiment)
+   return(d)
+}
+files  <- list.files(pattern = "*.csv$")
+
+df <- map_dfr(files, ~read_files(.))
+
+df <- df %>%
+   pivot_longer(
+      c(starts_with("x_"), starts_with("y_"), starts_with("likelihood_")),
+      names_to = c("name", "bodypart"),
+      names_sep = "_",
+      values_to = "value"
+   ) %>%
+   pivot_wider(names_from = name, values_from = value) %>% 
+   relocate(c(bodypart, x, y, likelihood), .after = id) 
+
+glimpse(df)
+#df  <-  df %>% 
+   #filter(!(bodypart %in% c("north", "south", "east", "west")))
+```
+
+## Exploratory Analysis
+
+Use the likelihood estimated by DLC to filter out unreliable data. 0.9 (dotted line below) seems to filter out most of the wrong label points. DLCで計算した確率で足切りする。とりあえず0.9を基準とすると明らかに変な点の大半は落とせそう。
+
+```{r check-likelihood}
+cutoff_likelihood = .9
+
+animals <- df %>% distinct(id) %>% pull()
+for (a in animals){
+   df_a <- df %>% filter(id == a) 
+
+   df_likelihood <- df_a %>% 
+      group_by(bodypart) %>%
+      summarise(likelihood_rate = sum(ifelse(likelihood<cutoff_likelihood, 1, 0))/n()) %>% 
+      mutate(likelihood_rate = round(likelihood_rate, 2)) %>% 
+      mutate(likelihood_rate = paste0("below cutoff =", likelihood_rate) %>% str_wrap(10))
+   
+   # use counts not density to conditionally change color
+   p_likelihod <- ggplot(df_a) +
+      geom_histogram(
+         aes(x=likelihood, fill = likelihood > cutoff_likelihood)
+      ) +
+      facet_wrap(vars(id)) +
+      geom_vline(xintercept = cutoff_likelihood, linetype = "dotted") +
+      geom_text(
+         aes(x = 0, y = Inf, label = likelihood_rate),
+         hjust = 0, vjust = 1,
+         df_likelihood
+      ) +
+      theme_minimal() +
+      facet_wrap(vars(bodypart)) +
+      scale_fill_manual(values = c("red", "dodgerblue")) +
+      labs(
+         title = paste0("DLC likelihood histogram: ", a),
+         subtitle = paste0("cutoff = ", cutoff_likelihood)
+      ) + 
+      theme(legend.position = "none")
+   print(p_likelihod)
+}
+
+# df <- df %>% filter(likelihood > cutoff_likelihood)
+```
+
+```{r adjust-trial}
+df_trial <- df %>% 
+   group_by(id, trial) %>% 
+   mutate(frame_max = max(frame)) %>% 
+   distinct(id, trial, frame_max) %>% 
+   group_by(id) %>% 
+   mutate(trial_frame = lag(frame_max))  %>% 
+   mutate(trial_frame = ifelse(is.na(trial_frame),0,trial_frame)) %>% 
+   mutate(trial_frame = cumsum(trial_frame)) 
+df <- df %>% left_join(df_trial) 
+# df %>% distinct(frame, id, trial)
+df <- df %>% mutate(trial_frame = frame + trial_frame)
+# glimpse(df)
+```
+
+Remove data frames around the time of platform removal
+
+
+```{r platform-time}
+fps <- 30
+# glimpse(df)
+
+df <- df %>% mutate(platform_frame = ifelse(frame < platform_sec*fps, TRUE, FALSE))
+df <- df %>% filter(frame > (platform_sec)*fps | platform_sec == 0 )
+
+```
+
+Take a look at the distribution of coordinates
+
+```{r data-exploratory-position, fig.dim = c(14, 8)}
+for (a in animals){
+   df_a <- df %>% 
+      filter(id == a) %>% 
+      filter(likelihood > cutoff_likelihood)
+
+   p_hist_x <- ggplot(df_a) +
+      geom_histogram(
+        aes(x = x, y = ..density..), 
+        position = "identity", alpha = 3/5) +
+      facet_wrap(vars(bodypart)) +   
+      theme_minimal() +
+      labs(
+         title = paste0("x coord histogram:", a)
+      )
+
+   
+   p_hist_y <- ggplot(df_a) +
+      geom_histogram(
+          aes(x = y, y = ..density..), 
+          position = "identity", alpha = 3/5) +
+      facet_wrap(vars(bodypart)) +   
+      theme_minimal() +
+      labs(
+         title = paste0("y coord histogram:", a)
+      )
+   print(p_hist_x + p_hist_y)
+}
+
+```
+
+### Visualise Bodyparts
+
+Visualise aligned bodyparts. Align bodypart using [the Kabsch algorithm](https://gist.github.com/jlmelville/9b4e5d076e719a7541881e8cbf58a895).
+ラベルデータの分布を確認するため、一番確率の高いフレームセットを基準にすべてのフレームの部位のアライメントをし、可視化する。アライメントする数が多いので結構時間がかかる。
+
+```{r kabsch}
+#' Kabsch Algorithm
+#' 
+#' Aligns two sets of points via rotations and translations.
+#' 
+#' Given two sets of points, with one specified as the reference set,
+#' the other set will be rotated so that the RMSD between the two is minimized.
+#' The format of the matrix is that there should be one row for each of
+#' n observations, and the number of columns, d, specifies the dimensionality
+#' of the points. The point sets must be of equal size and with the same
+#' ordering, i.e. point one of the second matrix is mapped to point one of
+#' the reference matrix, point two of the second matrix is mapped to point two 
+#' of the reference matrix, and so on.
+#'   
+#' @param pm n x d matrix of points to align to to \code{qm}.
+#' @param qm n x d matrix of reference points.
+#' @return Matrix \code{pm} rotated and translated so that the ith point 
+#'  is aligned to the ith point of \code{qm} in the least-squares sense.
+#' @references
+#' \url{https://en.wikipedia.org/wiki/Kabsch_algorithm}
+kabsch <- function(pm, qm) {
+  pm_dims <- dim(pm)
+  if (!all(dim(qm) == pm_dims)) {
+    stop(call. = TRUE, "Point sets must have the same dimensions")
+  }
+  # The rotation matrix will have (ncol - 1) leading ones in the diagonal
+  diag_ones <- rep(1, pm_dims[2] - 1)
+
+  # center the points
+  pm <- scale(pm, center = TRUE, scale = FALSE)
+  qm <- scale(qm, center = TRUE, scale = FALSE)
+
+  am <- crossprod(pm, qm)
+
+  svd_res <- svd(am)
+  # use the sign of the determinant to ensure a right-hand coordinate system
+  d <- determinant(tcrossprod(svd_res$v, svd_res$u))$sign
+  dm <- diag(c(diag_ones, d))
+
+  # rotation matrix
+  um <- svd_res$v %*% tcrossprod(dm, svd_res$u)
+
+  # Rotate and then translate to the original centroid location of qm
+  sweep(t(tcrossprod(um, pm)), 2, -attr(qm, "scaled:center"))
+}
+```
+
+```{r, align-bodypart}
+
+while (TRUE){
+   bodyparts <- df %>% 
+       filter(likelihood > cutoff_likelihood) %>%  
+      distinct(bodypart) %>% pull()
+   # find the frames that face all the bodyparts, after filtering points with low likelihood
+
+   complete_frames <- df %>% 
+      filter(likelihood > cutoff_likelihood) %>% 
+      # filter(frame < 1000) %>% 
+      group_by(id, trial_frame) %>% 
+      summarise(n_part = n()) %>%
+      ungroup() %>% 
+      filter(n_part == length(bodyparts)) %>% 
+      select(-n_part)
+
+      if (nrow(complete_frames) > 100 ) break
+      else if (cutoff_likelihood < .1) break
+      cutoff_likelihood = cutoff_likelihood - .1
+      paste("Changed cutoff likelihood to", cutoff_likelihood, "because of insufficient data")
+}
+
+complete_frames <- complete_frames %>% 
+   group_by(id) %>% 
+   sample_n(min(4000, n())) 
+
+
+df_align <- list()
+animals <- df %>% distinct(id) %>% pull()
+for (a in animals){
+   df_a <- df %>% right_join(complete_frames) %>% filter(id == a)
+   frames <- df_a %>% distinct(trial_frame) %>% pull()
+   
+   # use the point with highest likelihood as reference
+   ref_frame <- df_a %>% 
+      group_by(trial_frame) %>% 
+      summarise(sum_likelihood = sum(likelihood)) %>% 
+      filter(sum_likelihood == max(sum_likelihood)) %>% 
+      slice(1) %>% pull(trial_frame)
+   
+   qm <- data.frame(
+      x = df_a %>% filter(trial_frame == ref_frame) %>% arrange(bodypart) %>% pull(x),
+      y = df_a %>% filter(trial_frame == ref_frame) %>% arrange(bodypart) %>% pull(y)
+   )
+   df_align[[a]] <- data.frame(qm) %>% 
+      add_column(frame = ref_frame) %>% 
+      add_column(bodypart = sort(bodyparts))
+   for(i in seq_along(frames)){
+      # if (frames[i]==ref_frame) next
+      pm <- data.frame(
+         x = df_a %>% filter(trial_frame == frames[i]) %>% arrange(bodypart) %>% pull(x),
+         y = df_a %>% filter(trial_frame == frames[i]) %>% arrange(bodypart) %>% pull(y)
+      )
+      pm <- kabsch(pm,qm)
+      pm <- as.data.frame(pm)
+      names(pm) <- c("x","y")
+      df_align[[a]] <- df_align[[a]] %>% bind_rows(
+         pm %>% add_column(frame = frames[i])  %>%
+         add_column(bodypart = sort(bodyparts)) 
+      )
+   }
+   df_align[[a]] <- df_align[[a]] %>% 
+      add_column(id = a)   
+}
+
+df_align <- bind_rows(df_align)
+
+
+ggplot(tibble(df_align)) +
+   geom_density_2d(aes(x=x, y=y), adjust = 1/2) +
+   geom_point(
+      aes(x=x, y=y, color = bodypart), alpha = 1/3,
+      data = df_align %>% group_by(id) %>% sample_n(min(1000,n()))
+   ) +
+   facet_wrap(vars(id), scale = "free") +
+   theme_minimal() + 
+   labs(
+      title = "Density of aligned labels"
+   )
+
+```
+
+
+### Estimate boundaries
+
+個体ごとに箱の端と、台の境界をデータから推定。箱はx軸の位置の９８％qunatileから計算する境界はその中央とする。厳密には実験ごとに少し回転してるかもしれないが誤差は少なそう。大・崖の境界はその真ん中とする。必要ではないがyの境界も同様に計算しておく。
+
+```{r boundaries}
+df_boundaries  <- df %>% 
+   group_by(id) %>% 
+   reframe(
+      x = quantile(x, probs =c(0.01, 0.98)),
+      y = quantile(y, probs =c(0.01, 0.98)),
+      names = c("lower", "upper")) %>% 
+   pivot_wider(values_from = c(x, y), names_from = names) %>% 
+   mutate(
+      x_center = (x_lower + x_upper)/2,
+      y_center = (y_lower + y_upper)/2,
+   )   
+
+
+p_bounddary_x <- ggplot() +
+   geom_histogram(aes(x = x, y = ..density..), bins = 200, data = df) +
+   geom_vline(aes(xintercept = x_center), linetype = "dotted", data = df_boundaries) +
+   geom_vline(aes(xintercept = x_lower), data = df_boundaries) +
+   geom_vline(aes(xintercept = x_upper), data = df_boundaries) +
+   facet_wrap(vars(id)) +
+      theme_minimal() +
+   labs(
+         title = paste0("x boundaries")
+      )
+
+p_bounddary_y <- ggplot() +
+   geom_histogram(aes(x = y, y = ..density..), bins = 200, data = df) +
+   geom_vline(aes(xintercept = y_center), linetype = "dotted", data = df_boundaries) +
+   geom_vline(aes(xintercept = y_lower), data = df_boundaries) +
+   geom_vline(aes(xintercept = y_upper), data = df_boundaries) +
+   facet_wrap(vars(id)) +
+      theme_minimal() +
+   labs(
+         title = paste0("y boundaries")
+      )
+
+print(p_bounddary_x + p_bounddary_y)
+
+df <- df %>% left_join(df_boundaries)
+```
+
+### Visualise the path and heatmap of the animals
+
+Plot the path and heatmap of each of the bodyparts for each animal.
+ラベルが複数あるので、個体ごとに各部位の軌跡とヒートマップを作成する。
+
+```{r visualize-path, fig.dim = c(12, 8)}
+animals <- df %>% distinct(id) %>% pull()
+bodyparts <- df %>% filter(likelihood > cutoff_likelihood) %>%  
+   distinct(bodypart) %>% pull()
+for(a in animals){
+   for (b in bodyparts){
+    # a <- animals[3]
+       # b <- "bodycentre"
+      df_a <- df %>% 
+         filter(!platform_frame) %>% 
+         filter(id == a) %>% 
+         filter(bodypart == b) %>% 
+         filter(likelihood > cutoff_likelihood)
+
+      p_path <- ggplot(df_a) +
+         geom_path(aes(x=x, y=y, color = frame)) +
+         geom_vline(aes(xintercept = x_lower)) +
+         geom_vline(aes(xintercept = x_upper)) +
+         geom_vline(aes(xintercept = x_center), linetype = "dotted") +
+         geom_hline(aes(yintercept = y_lower)) +
+         geom_hline(aes(yintercept = y_upper)) +
+         geom_hline(aes(yintercept = y_center), linetype = "dotted") +
+         theme_minimal() +
+         scale_color_gradientn(colours = met.brewer("Nizami")) +
+         labs(
+            title = paste0("Path of ", a, " ", b)
+         )
+
+      p_heat <- ggplot(df_a) +
+         geom_hex(aes(x=x, y=y), bins = 15) +
+         geom_vline(aes(xintercept = x_lower)) +
+         geom_vline(aes(xintercept = x_upper)) +
+         geom_vline(aes(xintercept = x_center), linetype = "dotted") +
+         geom_hline(aes(yintercept = y_lower)) +
+         geom_hline(aes(yintercept = y_upper)) +
+         geom_hline(aes(yintercept = y_center), linetype = "dotted") +
+         theme_minimal() +
+         scale_fill_gradientn(colours = wes_palette("Zissou1", 50, type = "continuous")) +
+         labs(
+            title = paste0("Heatmap of ", a, " ", b)
+         ) +
+         theme(legend.position = "bottom")
+
+
+      print(p_path  + p_heat )
+   }
+}
+
+```
+
+
+```{r data-export}
+split_path <- function(path) {
+  if (dirname(path) %in% c(".", path))
+   return(basename(path))
+  return(c(basename(path), split_path(dirname(path))))
+}
+saveRDS(df, paste0("df_", split_path(getwd())[1], ".Rds"))
+```
+
