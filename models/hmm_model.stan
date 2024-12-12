@@ -1,7 +1,7 @@
 /*
 Hierarchical Hidden Markov Model for Visual Cliff Behavior Analysis
 
-This Stan model implements a 3-state HMM to analyze mouse movement data from visual cliff experiments.
+This Stan model implements a n-state HMM to analyze mouse movement data from visual cliff experiments.
 The model identifies and characterizes discrete behavioral states and their transitions in response 
 to visual stimuli and environmental features.
 
