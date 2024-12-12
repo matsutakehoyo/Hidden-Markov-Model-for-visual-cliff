@@ -1,0 +1,223 @@
+---
+title: "correct_coordinates"
+author: "Take Matsuyama"
+date: "2023/04/19"
+output: html_document
+editor_options: 
+   chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width='80%',
+  out.height='80%'
+)
+```
+
+
+```{r library-source}
+library(tidyverse)
+library(readxl)
+source("take.R")
+library(patchwork)
+library(ggforce) # to draw circles in ggplot
+# library(future)
+# plan(multisession, workers = parallel::detectCores() - 1) # Use all available cores
+
+```
+
+
+# Overview
+
+実験日：2023/03/08
+
+撮影した動画の崖が斜めになっており、このままだと崖上崖下の位置がidによってずれがあり解析に用いるのに大変不便である。そのため崖の位置を固定する処置を行い、解析しやすい環境を構築する。
+
+円の中心座標と、崖の測定点（２ポイント）から
+
+- 円の中心を座標の中心にする
+- 崖が垂直になるように円の中心を起点に座標を回転する。
+
+`estimate_field-circle.Rmd` を実行して得られた`*_circle.Rds`ファイルよりラベルデータを読み込む。崖のデータはfijiでマニュアルで測定したもの(`cliff coordinates.xlsx`)を読み込む
+
+```{r load-data}
+df <- readRDS(paste0("df_", split_path(getwd())[1], "_circle.Rds"))
+
+df_cliff <- read_excel(file.path("..", "cliff coordinates.xlsx")) %>% 
+  mutate(
+    cliff_angle = atan((upper_left_y - lower_right_y)/(upper_left_x - lower_right_x))
+  )
+
+df <- df %>% left_join(df_cliff)
+
+```
+
+- read_excel(file.path("..", "cliff coordinates.xlsx")) 
+→ ".."は、一つ上のworking directoryを指定するときに使う。"."は、同じworking directoryである。
+
+- cliff_angle = atan((upper_left_y - lower_right_y)/(upper_left_x - lower_right_x))
+→ ２点を結ぶ線に対するx軸との角度を求める式。
+(x,y) = (upper_left_x, upper_left_y)と、(x,y) = (upper_right_x, upper_rigtht_y)のときの2点を結ぶ線に対するx軸との角度を求めている。
+- atan,atan2について<https://mathwords.net/atan2>
+
+```{r plot-data}
+animals <- unique(df$id)
+for (a in animals){
+  df_ab <- df %>% 
+    filter(id == a)
+
+  df_circle_cliff_ab <- df_ab %>% 
+    filter(id == a) %>% 
+    distinct(
+      bodypart,
+      center_x, center_y, radius,   # circle parameters 
+      upper_left_x, upper_left_y, lower_right_x, lower_right_y  # cliff line points
+    )
+
+  p_estimate <- ggplot() +
+    geom_point(
+      aes(x = x, y = y), 
+      alpha = 1/50, size = .1,
+      data = df_ab
+    ) +
+    geom_point(
+      aes(x = center_x, y = center_y), size = 2, color = "purple",
+      data = df_circle_cliff_ab
+    ) +
+    geom_segment(
+      aes(x = upper_left_x, y = upper_left_y, xend = lower_right_x, yend = lower_right_y),
+      color = "limegreen",
+      data = df_circle_cliff_ab
+    ) +
+    ggforce::geom_circle(
+      aes(x0 = center_x, y0 = center_y, r = radius),
+      color = "purple",
+      data = df_circle_cliff_ab
+    ) + 
+    coord_fixed() +
+    facet_wrap(vars(bodypart)) +
+    theme_minimal() +
+    labs(paste("id =", a))  
+
+  print(p_estimate)
+}
+
+```
+
+- unique関数<https://qiita.com/ymmy02/items/368c280f30bd5cd8d179><https://a-habakiri.hateblo.jp/entry/2016/11/28/220443>
+- geom_segment<https://ggplot2.tidyverse.org/reference/geom_segment.html>
+
+円の中心はボディーパーツごとに少し違うので回転する角度は一緒だが、起点となる点がボディーパーツごとにことなる。つまり円の中心は必ずしも崖をトレースした線に乗っていないが大きくずれていなければ問題はない。
+
+```{r fix_coordinates}
+df <- df %>% 
+  mutate(x_original = x, y_original = y) %>% 
+  mutate(
+    x = (x_original - center_x) * cos(pi/2 - cliff_angle) - (y_original - center_y) * sin(pi/2 - cliff_angle), 
+    y = (x_original - center_x) * sin(pi/2 - cliff_angle) + (y_original - center_y) * cos(pi/2 - cliff_angle) 
+  )
+
+# this data frame is constructed only to check the rotation
+df_cliff_points <- df %>% 
+  distinct(id, bodypart, center_x, center_y, radius, cliff_angle, upper_left_x, upper_left_y, lower_right_x, lower_right_y) %>% 
+  pivot_longer(upper_left_x:lower_right_y) %>% 
+  separate(name, -1, into = c("reference_point", "coord")) %>% 
+  pivot_wider(names_from = coord, values_from = value)
+
+df_cliff_points <- df_cliff_points %>% 
+  rename(x_original = x, y_original = y) %>% 
+  mutate(
+    x_corrected = (x_original - center_x) * cos(pi/2 - cliff_angle) - (y_original - center_y) * sin(pi/2 - cliff_angle), 
+    y_corrected = (x_original - center_x) * sin(pi/2 - cliff_angle) + (y_original - center_y) * cos(pi/2 - cliff_angle) 
+  ) %>% 
+  pivot_longer(
+    x_original:y_corrected
+  ) %>% 
+  separate(
+    name, into = c("xy", "coord")
+  ) %>% 
+  pivot_wider(
+    names_from = xy, values_from = value, 
+  )
+
+ggplot(df_cliff_points) +
+  geom_line(
+    aes(x = x, y = y, group = coord, linetype = coord)
+  ) +
+  geom_point(
+    aes(x = x, y = y, color = bodypart, shape = reference_point)
+  ) +
+  facet_wrap(vars(id)) + 
+  coord_fixed() +
+  theme_minimal()
+
+```
+
+x = (x_original - center_x) * cos(pi/2 - cliff_angle) - (y_original - center_y) * sin(pi/2 - cliff_angle), 
+y = (x_original - center_x) * sin(pi/2 - cliff_angle) + (y_original - center_y) * cos(pi/2 - cliff_angle)
+→x,yを(0.0)を中心に移動した上で、cliff_angle分傾ける
+
+その後、きちんと回転していたかどうかをチェックしている。
+
+Check the rotated data. 
+
+```{r plot-results}
+for (a in animals){
+  df_ab <- df %>% 
+    filter(id == a)
+
+  df_circle_cliff_ab <- df_ab %>% 
+    filter(id == a) %>% 
+    distinct(
+      bodypart,
+      center_x, center_y, radius,   # circle parameters 
+      upper_left_x, upper_left_y, lower_right_x, lower_right_y  # 
+    )
+
+  p_estimate <- ggplot() +
+    geom_point(
+      aes(x = x, y = y), 
+      alpha = 1/50, size = .1, color = "orange",
+      data = df_ab
+    ) +
+    geom_point(
+      aes(x = 0, y = 0), size = 2, color = "purple",
+      data = df_circle_cliff_ab
+    ) +
+    geom_segment(
+      aes(x = upper_left_x, y = upper_left_y, xend = lower_right_x, yend = lower_right_y),
+      color = "limegreen",
+      data = df_circle_cliff_ab
+    ) +
+    ggforce::geom_circle(
+      aes(x0 = 0, y0 = 0, r = radius),
+      color = "purple",
+      data = df_circle_cliff_ab
+    ) + 
+    coord_fixed() +
+    facet_wrap(vars(bodypart)) +
+    theme_minimal() +
+    labs(paste("id =", a))  
+
+  print(p_estimate)
+}
+```
+
+```{r save-data}
+
+split_path <- function(path) {
+  if (dirname(path) %in% c(".", path))
+   return(basename(path))
+  return(c(basename(path), split_path(dirname(path))))
+}
+
+saveRDS(df, paste0("df_", split_path(getwd())[1], "_rotated.Rds"))
+
+```
+
+- get working directory<https://rstudy.info/working-directory/>
+- split_path<https://rdrr.io/cran/pathological/man/split_path.html>
