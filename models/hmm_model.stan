@@ -208,143 +208,217 @@ functions {
     return wcauchy_log_lik(a_t, lambda, rho);
   }
 }
+
+
 data {
-  // Dimensions
-  int<lower=1> n_states;          // number of states (3)
-  int<lower=1> n_obs;            // total number of observations
-  int<lower=1> n_trk;            // number of tracks
-  int<lower=1> n_smp;            // number of samples/trials
-  int<lower=1> n_grp;            // number of groups
-  int<lower=1> n_cov;            // number of covariates
+  //=============================================================================
+  // Dimensions and Indexing Variables
+  //=============================================================================
   
-  // Indexing variables
-  int<lower=1, upper=n_trk> trk[n_obs];  // track index for each observation
-  int<lower=1, upper=n_smp> smp[n_obs];  // sample index for each observation
-  int<lower=1, upper=n_grp> smp2grp[n_smp];  // group index for each sample
+  // Core dimensions
+  int<lower=1> n_states;     // Number of behavioral states (fixed at 3)
+  int<lower=1> n_obs;        // Total number of observations
+  int<lower=1> n_trk;        // Number of continuous movement tracks
+  int<lower=1> n_smp;        // Number of samples/trials
+  int<lower=1> n_grp;        // Number of experimental groups
+  int<lower=1> n_cov;        // Number of environmental covariates
   
-  // Movement data
-  vector[n_obs] l;               // step lengths
-  vector[n_obs] a;               // angles
-  vector[n_obs] edge_l;          // distance to edge
-  vector[n_obs] edge_a;          // angle to edge
-  vector[n_obs] cliff_l;         // distance to cliff
-  int<lower=1, upper=2> angle_type[n_obs];  // movement direction type
+  // Indexing arrays for hierarchical structure
+  int<lower=1, upper=n_trk> trk[n_obs];    // Track index for each observation
+  int<lower=1, upper=n_smp> smp[n_obs];    // Sample/trial index for each observation
+  int<lower=1, upper=n_grp> smp2grp[n_smp]; // Group index for each sample
   
-  // Environmental covariates
-  matrix[n_obs, 1+n_cov] cov;    // covariate matrix [intercept, cliff, edge, center]
+  //=============================================================================
+  // Movement Data
+  //=============================================================================
   
-  // Fixed parameters
-  real cliff_x;                  // cliff influence threshold
-  real cliff_beta;               // cliff influence slope
+  vector[n_obs] l;           // Step lengths (-99 for missing values)
+  vector[n_obs] a;           // Turning angles in radians (-99 for missing)
+  vector[n_obs] edge_l;      // Distance to nearest arena edge
+  vector[n_obs] edge_a;      // Angle to nearest edge
+  vector[n_obs] cliff_l;     // Distance to visual cliff edge
+  
+  // Movement direction type for angle calculations
+  // 1: clockwise movement relative to edge
+  // 2: counterclockwise movement relative to edge
+  int<lower=1, upper=2> angle_type[n_obs];
+  
+  // Minimum separation between state means to ensure identifiability
+  real<lower=0> min_mu_sep;
+  
+  //=============================================================================
+  // Environmental Data
+  //=============================================================================
+  
+  // Environmental covariate matrix [intercept, cliff, edge, center]
+  // Used to modulate transition probabilities based on spatial features
+  matrix[n_obs, 1+n_cov] cov;
+  
+  // Fixed parameters for cliff influence
+  real cliff_x;              // Distance threshold for cliff effect
+  real cliff_beta;           // Slope parameter for cliff sigmoid
 }
+
+/*
+Model Implementation Notes
+------------------------
+1. Missing Data Handling:
+   - Missing values are coded as -99
+   - TPM calculation handles missing data by using uniform probabilities
+   - Forward algorithm appropriately skips likelihood calculation for missing values
+
+2. State Identifiability:
+   - States are ordered by mean step length (positive_ordered constraint)
+   - Minimum separation between state means is enforced
+   - Horseshoe prior helps with parameter identification
+
+3. Numerical Stability:
+   - Log space calculations used throughout
+   - Stable implementation of wrapped Cauchy distribution
+   - Careful handling of edge cases in forward algorithm
+*/
 
 parameters {
-  // ===== TPM Regression Coefficients =====
-  // Horseshoe prior structure for regularization
-  matrix[3 * n_states - 2, n_cov+1] beta_raw[n_smp];    // individual-level coefficients
-  matrix[3 * n_states - 2, n_cov+1] beta0[n_grp];       // group-level coefficients
-  vector<lower = 0>[n_cov+1] beta_tau;                  // global shrinkage
-  matrix<lower =0>[3 * n_states - 2, n_cov+1] beta_lambda;  // local shrinkage
-  vector<lower = 0>[n_cov+1] beta0_sigma;               // group-level variation
-
-  // ===== Step Length Parameters =====
-  // Gamma distribution parameters
-  positive_ordered[n_states] l_mu[n_smp];    // individual-level means
-  vector<lower=0>[n_states] l_va[n_smp];     // individual-level variances
-  positive_ordered[n_states] l_mu0[n_grp];   // group-level means
-  vector<lower=0>[n_states] l_va0[n_grp];    // group-level variances
-  real<lower = 0> l_mu0_sigma[n_states];     // mean variation across groups
-  real<lower = 0> l_va0_sigma[n_states];     // variance variation across groups
-
-  // ===== Angular Parameters =====
-  // Base movement parameters (wrapped Cauchy)
-  vector<lower = 0, upper =1>[n_states] a_rho0[n_grp];    // group-level concentration
-  vector<lower = 0, upper =1>[n_states] a_rho[n_smp];     // individual-level concentration
-  real<lower = 0> a_rho0_phi;                             // concentration hyperparameter
-
-  // Edge influence parameters
-  vector<lower=0, upper=1>[n_states] edge_rho0[n_grp];    // group-level edge effect
-  vector<lower=0, upper=1>[n_states] edge_rho[n_smp];     // individual-level edge effect
-  real<lower = 0> edge_rho0_phi;                          // edge effect hyperparameter
+  //=============================================================================
+  // State Transition Parameters
+  //=============================================================================
   
-  // Cliff influence parameters
-  vector<lower=0, upper=1>[n_states] cliff_rho0[n_grp];   // group-level cliff effect
-  vector<lower=0, upper=1>[n_states] cliff_rho[n_smp];    // individual-level cliff effect
-  real<lower = 0> cliff_rho0_phi;                         // cliff effect hyperparameter
-
-  // Center influence parameters
-  vector<lower=0, upper=1>[n_states] center_rho0[n_grp];  // group-level center effect
-  vector<lower=0, upper=1>[n_states] center_rho[n_smp];   // individual-level center effect
-  real<lower = 0> center_rho0_phi;                        // center effect hyperparameter
-
-  // ===== Spatial Influence Parameters =====
-  // Edge effects
-  vector<upper=0>[n_grp] edge_beta0;                      // group-level edge slope
-  vector<upper=0>[n_smp] edge_beta;                       // individual-level edge slope
-  real<lower=0> edge_beta0_sigma;                         // edge slope variation
-  vector<lower=0, upper=30>[n_grp] edge_x0;               // group-level edge threshold
-  vector<lower=0, upper=30>[n_smp] edge_x;                // individual-level edge threshold
-  real<lower=0> edge_x0_sigma;                            // edge threshold variation
-
-  // Center effects
-  vector<upper=0>[n_grp] center_beta0;                    // group-level center slope
-  vector<upper=0>[n_smp] center_beta;                     // individual-level center slope
-  real<lower=0> center_beta0_sigma;                       // center slope variation
-  vector<lower=0, upper=30>[n_grp] center_x0;             // group-level center threshold
-  vector<lower=0, upper=30>[n_smp] center_x;              // individual-level center threshold
-  real<lower=0> center_x0_sigma;                          // center threshold variation
+  // === Transition Probability Matrix (TPM) Regression Coefficients ===
+  // Horseshoe prior structure for sparse regression
+  matrix[3 * n_states - 2, n_cov+1] beta_raw[n_smp];    // Individual-level
+  matrix[3 * n_states - 2, n_cov+1] beta0[n_grp];       // Group-level
+  vector<lower=0>[n_cov+1] beta_tau;                    // Global shrinkage
+  matrix<lower=0>[3 * n_states - 2, n_cov+1] beta_lambda; // Local shrinkage
+  vector<lower=0>[n_cov+1] beta0_sigma;                 // Group variation
+  
+  //=============================================================================
+  // Movement Parameters
+  //=============================================================================
+  
+  // === Step Length Parameters ===
+  // Gamma distribution parameters for each state
+  positive_ordered[n_states] l_mu[n_smp];     // Individual means
+  vector<lower=0>[n_states] l_va[n_smp];      // Individual variances
+  positive_ordered[n_states] l_mu0[n_grp];    // Group means
+  vector<lower=0>[n_states] l_va0[n_grp];     // Group variances
+  real<lower=0> l_mu0_sigma[n_states];        // Mean variation
+  real<lower=0> l_va0_sigma[n_states];        // Variance variation
+  
+  // === Angular Parameters ===
+  // Base movement parameters (wrapped Cauchy distribution)
+  vector<lower=0, upper=1>[n_states] a_rho0[n_grp];     // Group concentration
+  vector<lower=0, upper=1>[n_states] a_rho[n_smp];      // Individual concentration
+  real<lower=0> a_rho0_phi;                             // Concentration hyper-param
+  
+  //=============================================================================
+  // Environmental Influence Parameters
+  //=============================================================================
+  
+  // === Edge Effects ===
+  vector<lower=0, upper=1>[n_states] edge_rho0[n_grp];  // Group effect
+  vector<lower=0, upper=1>[n_states] edge_rho[n_smp];   // Individual effect
+  real<lower=0> edge_rho0_phi;                          // Effect hyper-param
+  vector<upper=0>[n_grp] edge_beta0;                    // Group slope
+  vector<upper=0>[n_smp] edge_beta;                     // Individual slope
+  real<lower=0> edge_beta0_sigma;                       // Slope variation
+  vector<lower=0, upper=30>[n_grp] edge_x0;            // Group threshold
+  vector<lower=0, upper=30>[n_smp] edge_x;             // Individual threshold
+  real<lower=0> edge_x0_sigma;                         // Threshold variation
+  
+  // === Cliff Effects ===
+  vector<lower=0, upper=1>[n_states] cliff_rho0[n_grp]; // Group effect
+  vector<lower=0, upper=1>[n_states] cliff_rho[n_smp];  // Individual effect
+  real<lower=0> cliff_rho0_phi;                         // Effect hyper-param
+  
+  // === Center Effects ===
+  vector<lower=0, upper=1>[n_states] center_rho0[n_grp]; // Group effect
+  vector<lower=0, upper=1>[n_states] center_rho[n_smp];  // Individual effect
+  real<lower=0> center_rho0_phi;                         // Effect hyper-param
+  vector<upper=0>[n_grp] center_beta0;                   // Group slope
+  vector<upper=0>[n_smp] center_beta;                    // Individual slope
+  real<lower=0> center_beta0_sigma;                      // Slope variation
+  vector<lower=0, upper=30>[n_grp] center_x0;           // Group threshold
+  vector<lower=0, upper=30>[n_smp] center_x;            // Individual threshold
+  real<lower=0> center_x0_sigma;                        // Threshold variation
 }
 
-transformed parameters {
-  // ===== State Transition Parameters =====
-  matrix[n_states, n_states] log_gamma[n_obs];    // log transition probabilities for each observation
-  
-  // ===== Step Length Distribution Parameters =====
-  vector[n_states] l_shape[n_smp];    // shape parameter for gamma distribution
-  vector[n_states] l_rate[n_smp];     // rate parameter for gamma distribution
-  
-  // ===== Regression Coefficients =====
-  matrix[3 * n_states - 2, n_cov+1] beta[n_smp];  // individual-level TPM coefficients
-  
-  // ===== Transformed Covariates =====
-  matrix[n_obs, 1+n_cov] cov_trans;   // sigmoid-transformed environmental covariates
 
-  // Calculate individual-level regression coefficients from hierarchical structure
+transformed parameters {
+  //=============================================================================
+  // Transition Probability Parameters
+  //=============================================================================
+  
+  // Log transition probability matrices for each observation
+  // Dimensions: [n_obs, n_states, n_states]
+  // Each matrix contains log probabilities of transitioning between states
+  matrix[n_states, n_states] log_gamma[n_obs];    
+  
+  //=============================================================================
+  // Movement Distribution Parameters
+  //=============================================================================
+  
+  // Gamma distribution parameters for step lengths, derived from mean/variance
+  vector[n_states] l_shape[n_smp];    // Shape parameter for each state and sample
+  vector[n_states] l_rate[n_smp];     // Rate parameter for each state and sample
+  
+  // Individual-level transition matrix coefficients
+  // Dimensions: [n_smp, 3*n_states-2, n_cov+1]
+  // Only adjacent state transitions are allowed
+  matrix[3 * n_states - 2, n_cov+1] beta[n_smp];
+  
+  // Transformed environmental covariates incorporating spatial effects
+  // Each covariate is transformed through a sigmoid function
+  matrix[n_obs, 1+n_cov] cov_trans;
+  
+  //=============================================================================
+  // Parameter Transformations
+  //=============================================================================
+  
+  // Calculate individual-level parameters from hierarchical structure
   for (s in 1:n_smp) {
-    // Transform TPM coefficients
+    // Transform TPM coefficients with regularization
+    // Combines group-level effects with individual variation
     for (c in 1:(n_cov+1)) {
       beta[s,,c] = beta0[smp2grp[s],,c] + beta0_sigma[c] * beta_raw[s,,c];
     }
     
-    // Calculate gamma distribution parameters for step lengths
+    // Calculate gamma distribution parameters for each state
+    // Converts from mean/variance parameterization to shape/rate
     for (n in 1:n_states) {
+      // Shape = μ²/σ², Rate = μ/σ²
       l_shape[s,n] = l_mu[s,n] * l_mu[s,n] / (l_va[s,n]);
       l_rate[s,n] = l_mu[s,n] / (l_va[s,n]);
     }
   }
 
-  // Calculate transition probability matrices
+  // Calculate transition probability matrices for each observation
   for (t in 1:n_obs) {
     // Transform environmental covariates using sigmoid functions
     for (c in 1:(n_cov+1)) {
       if (c == 1) {
-        cov_trans[t,c] = 1;  // intercept term
+        cov_trans[t,c] = 1;  // Intercept term
       } else if (c==2) {
-        // Cliff influence
+        // Cliff influence: fixed threshold and slope parameters
         cov_trans[t,c] = inv_logit((cov[t,c] - cliff_x) * cliff_beta);
       } else if (c==3) {
-        // Edge influence
-        cov_trans[t,c] = inv_logit((cov[t,c] - edge_x[smp[t]]) * edge_beta[smp[t]]);
+        // Edge influence: learned individual-specific parameters
+        cov_trans[t,c] = inv_logit((cov[t,c] - edge_x[smp[t]]) * 
+                                  edge_beta[smp[t]]);
       } else if (c==4) {
-        // Center influence
-        cov_trans[t,c] = inv_logit((cov[t,c] - center_x[smp[t]]) * center_beta[smp[t]]);
+        // Center influence: learned individual-specific parameters
+        // Distance from edge used as proxy for center proximity
+        cov_trans[t,c] = inv_logit((cov[t,c] - center_x[smp[t]]) * 
+                                  center_beta[smp[t]]);
       }
     }
 
-    // Compute TPM or set to uniform for missing data
+    // Compute transition probability matrix or set to uniform for missing data
     if (l[t] != -99) {
+      // Calculate structured TPM allowing only neighboring transitions
       log_gamma[t] = compute_log_gamma(n_states, beta[smp[t]], cov_trans[t]');
     } else {
+      // Use uniform distribution for missing data points
+      // This ensures proper probability flow in forward algorithm
       for(i in 1:n_states) {
         log_gamma[t][i, ] = rep_row_vector(-log(n_states), n_states);
       }
@@ -355,76 +429,107 @@ transformed parameters {
 
 
 model {
-  // ===== Prior Distributions =====
+  //=============================================================================
+  // Prior Distributions
+  //=============================================================================
   
-  // --- TPM Coefficient Priors ---
-  // Horseshoe prior structure
-  beta_tau ~ cauchy(0,1);  // global shrinkage
+  // === TPM Coefficient Priors ===
+  // Horseshoe prior structure for sparse regression
+  // Global shrinkage parameter
+  beta_tau ~ cauchy(0, 1);  
+  
+  // Local shrinkage parameters and coefficient priors
   for (c in 1:(n_cov+1)) {
     for (i in 1:(3 * n_states - 2)) {
-      beta_lambda[i,c] ~ cauchy(0,1);  // local shrinkage
+      // Local shrinkage with half-Cauchy prior
+      beta_lambda[i,c] ~ cauchy(0, 1);  
+      // Group-level coefficients with adaptive shrinkage
       beta0[,i,c] ~ normal(0, beta_lambda[i,c] * beta_tau[c]);
     }
   }
 
   // Individual-level coefficient variations
-  beta0_sigma ~ normal(0,1);
+  beta0_sigma ~ normal(0, 1);  // Prior for group-level standard deviation
   for (i in 1:(3 * n_states - 2)) {
-    for (c in 1:(n_cov+1))
+    for (c in 1:(n_cov+1)) {
+      // Standard normal prior for individual variations
       beta_raw[,i,c] ~ std_normal();
+    }
   }
 
-  // --- Movement Parameter Priors ---
-  // Group level
+  // === Movement Parameter Priors ===
+  // Group-level parameters
   for(g in 1:n_grp) {
-    // Step length parameters
-    l_mu0[g, ] ~ normal(0,2) T[0, ];
-    l_va0[g, ] ~ normal(0,.2) T[0, ];
+    // Step length parameters - weakly informative priors
+    l_mu0[g, ] ~ normal(0, 2) T[0, ];     // Positive mean
+    l_va0[g, ] ~ normal(0, 0.2) T[0, ];   // Positive variance, tighter prior
     
-    // Angular concentration parameters
-    a_rho0[g, ] ~ beta(2,2);      // base angle distribution
-    cliff_rho0[g, ] ~ beta(2,2);  // near cliff
-    edge_rho0[g, ] ~ beta(2,2);   // near wall  
-    center_rho0[g, ] ~ beta(2,2); // near center  
+    // Angular concentration parameters - Beta(2,2) for moderate concentration
+    a_rho0[g, ] ~ beta(2, 2);             // Base angle distribution
+    cliff_rho0[g, ] ~ beta(2, 2);         // Near cliff concentration
+    edge_rho0[g, ] ~ beta(2, 2);          // Near edge concentration
+    center_rho0[g, ] ~ beta(2, 2);        // Near center concentration
   
     // Spatial influence parameters
-    edge_beta0[g] ~ normal(0,10) T[, 0];
-    center_beta0[g] ~ normal(0,10) T[, 0];
-    target += beta_lpdf(edge_x0[g] / 30 | 1, 9) - log(30);
-    target += beta_lpdf(center_x0[g] / 30 | 1, 9) - log(30);
+    // Negative slopes encourage avoidance behavior
+    edge_beta0[g] ~ normal(0, 10) T[, 0];    // Edge avoidance
+    center_beta0[g] ~ normal(0, 10) T[, 0];  // Center avoidance
+    
+    // Distance thresholds scaled to arena size (30 units)
+    // Edge threshold: Beta(2,10) favors detection near walls
+    target += beta_lpdf(edge_x0[g] / 30 | 2, 10) - log(30);
+    // Center threshold: Beta(3,3) allows more variation
+    target += beta_lpdf(center_x0[g] / 30 | 3, 3) - log(30);
   } 
 
-  // Hyperparameters
-  l_mu0_sigma ~ normal(0,.5) T[0, ];
-  l_va0_sigma ~ normal(0,.5) T[0, ];
+  // === Hyperpriors ===
+  // Half-normal priors for variance components
+  l_mu0_sigma ~ normal(0, 0.5) T[0, ];    // Step length mean variation
+  l_va0_sigma ~ normal(0, 0.5) T[0, ];    // Step length variance variation
   
-  // Concentration hyperparameters
-  a_rho0_phi ~ gamma(2, 0.5);     // base angle
-  cliff_rho0_phi ~ gamma(2, 0.5);  // cliff effect
-  edge_rho0_phi ~ gamma(2, 0.5);   // edge effect  
-  center_rho0_phi ~ gamma(2, 0.5); // center effect  
+  // Gamma priors for concentration parameters
+  // Shape=2, rate=0.5 gives moderate prior concentration
+  a_rho0_phi ~ gamma(2, 0.5);             // Base angle concentration
+  cliff_rho0_phi ~ gamma(2, 0.5);         // Cliff effect concentration
+  edge_rho0_phi ~ gamma(2, 0.5);          // Edge effect concentration
+  center_rho0_phi ~ gamma(2, 0.5);        // Center effect concentration
   
   // Spatial influence variations
-  edge_x0_sigma ~ normal(0,1) T[0, ];    
-  edge_beta0_sigma ~ normal(0,1) T[0, ];  
-  center_x0_sigma ~ normal(0,1) T[0, ];    
-  center_beta0_sigma ~ normal(0,1) T[0, ];  
+  // Half-normal priors for standard deviations
+  edge_x0_sigma ~ normal(0, 1) T[0, ];    // Edge threshold variation    
+  edge_beta0_sigma ~ normal(0, 1) T[0, ]; // Edge slope variation
+  center_x0_sigma ~ normal(0, 1) T[0, ];  // Center threshold variation
+  center_beta0_sigma ~ normal(0, 1) T[0, ]; // Center slope variation
 
-  // --- Individual Level Parameters ---
+  // === Individual Level Parameters ===
   for (s in 1:n_smp) {
+    // Spatial influence parameters
     edge_beta[s] ~ normal(edge_beta0[smp2grp[s]], edge_beta0_sigma);   
     edge_x[s] ~ normal(edge_x0[smp2grp[s]], edge_x0_sigma);   
     center_beta[s] ~ normal(center_beta0[smp2grp[s]], center_beta0_sigma);   
     center_x[s] ~ normal(center_x0[smp2grp[s]], center_x0_sigma);       
   }
 
+  // State-specific parameters
   for (state in 1:n_states) {
     for (s in 1:n_smp) {
       // Step length parameters
       l_mu[s,state] ~ normal(l_mu0[smp2grp[s], state], l_mu0_sigma[state]);
-      l_va[s,state] ~ normal(l_va0[smp2grp[s], state], l_va0_sigma[state]);
+      
+      // Enforce minimum separation between states
+      if(state > 1) {  
+        if(l_mu[s,state] - l_mu[s,state-1] < min_mu_sep) {
+          // Soft constraint using normal penalty
+          target += normal_lpdf(l_mu[s,state] - l_mu[s,state-1] | min_mu_sep, 0.05);
+        }
+      }
 
-      // Angular concentration parameters
+      // Step length variance with penalty for large values
+      l_va[s,state] ~ normal(l_va0[smp2grp[s], state], l_va0_sigma[state]);
+      target += -2 * log1p(l_va[s,state]);  // Penalize large variances
+
+      // Angular concentration parameters with beta priors
+      // Each uses hierarchical structure with concentration hyperparameter
       a_rho[s,state] ~ beta(a_rho0[smp2grp[s], state] * a_rho0_phi, 
                            (1 - a_rho0[smp2grp[s], state]) * a_rho0_phi);
       edge_rho[s,state] ~ beta(edge_rho0[smp2grp[s], state] * edge_rho0_phi, 
@@ -436,79 +541,100 @@ model {
     }
   }
 
-  // ===== Likelihood Calculation =====
-  vector[n_states] logp;      // forward variables
-  vector[n_states] logptemp;  // temporary storage for forward algorithm
-
-  // Forward algorithm implementation for HMM likelihood
+  //=============================================================================
+  // Likelihood Calculation using Forward Algorithm
+  //=============================================================================
+  
+  vector[n_states] logp;      // Forward variables
+  vector[n_states] logptemp;  // Temporary storage
+  
+  // Implement forward algorithm for HMM likelihood
   for (t in 1:n_obs) {
-    // Reset forward variables at the start of each track
+    // Initialize forward variables at start of each track
     if(t == 1 || trk[t] != trk[t - 1]) {
-      logp = rep_vector(-log(n_states), n_states);  // initialize with uniform state distribution
+      // Uniform initial state distribution
+      logp = rep_vector(-log(n_states), n_states);
     }
 
     // Calculate forward probabilities for each state
     for (state in 1:n_states) {
-      // Transition probability
+      // 1. Transition probability from previous states
       logptemp[state] = log_sum_exp(logp + log_gamma[t][ , state]);
       
-      // Emission probability: step length
-      if (l[t]!=-99) {
-        logptemp[state] = logptemp[state] + 
-          gamma_lpdf(l[t] | l_shape[smp[t],state], l_rate[smp[t],state]);
+      // 2. Emission probability: step length (if not missing)
+      if (l[t] != -99) {
+        logptemp[state] += gamma_lpdf(l[t] | l_shape[smp[t],state], 
+                                            l_rate[smp[t],state]);
       }
       
-      // Emission probability: angle
-      if (t >= 2 && trk[t] == trk[t-1] && a[t]!=-99 && a[t-1]!=-99) {
-        logptemp[state] = logptemp[state] +
-          angle_log_lik(
-            a[t], a[t-1], angle_type[t], edge_a[t], 
-            cliff_l[t],  6, -1, 
-            edge_l[t],  edge_x[smp[t]], edge_beta[smp[t]], 
-            (30-edge_l[t]),  center_x[smp[t]], center_beta[smp[t]], 
-            a_rho[smp[t],state], cliff_rho[smp[t],state], 
-            edge_rho[smp[t],state], center_rho[smp[t],state]);
+      // 3. Emission probability: turning angle 
+      // Only calculated if we have two consecutive observations in same track
+      if (t >= 2 && trk[t] == trk[t-1] && a[t] != -99 && a[t-1] != -99) {
+        logptemp[state] += angle_log_lik(
+          a[t], a[t-1], angle_type[t], edge_a[t], 
+          cliff_l[t], cliff_x, cliff_beta, 
+          edge_l[t], edge_x[smp[t]], edge_beta[smp[t]], 
+          (30-edge_l[t]), center_x[smp[t]], center_beta[smp[t]], 
+          a_rho[smp[t],state], cliff_rho[smp[t],state], 
+          edge_rho[smp[t],state], center_rho[smp[t],state]);
       }
     }
     
     // Update forward variables
     logp = logptemp;
 
-    // Add log probability at the end of each track
+    // Add log probability at end of each track
     if(t == n_obs || trk[t+1] != trk[t]) {
-      target += log_sum_exp(logp);  // marginalize over final states
+      target += log_sum_exp(logp);  // Marginalize over final states
     }
   }
 }
 
 generated quantities {
-  // Output variables
-  int<lower=1, upper=n_states> z_star[n_obs];  // most likely state sequence
-  real logp_z_star;                            // log probability of most likely sequence
-  vector[n_obs] log_lik;                       // observation-wise log likelihoods
+  //=============================================================================
+  // Output Variables
+  //=============================================================================
+  
+  // Most likely state sequence from Viterbi algorithm
+  int<lower=1, upper=n_states> z_star[n_obs];
+  
+  // Log probability of the most likely state sequence
+  real logp_z_star;
+  
+  // Observation-wise log likelihoods for model evaluation
+  vector[n_obs] log_lik;
 
   {
-    // Viterbi algorithm workspace
-    int back_ptr[n_obs, n_states];             // backpointers for state reconstruction
-    real best_logp[n_obs, n_states];           // log probabilities for best paths
+    //===========================================================================
+    // Viterbi Algorithm Implementation
+    //===========================================================================
+    
+    // Workspace variables for Viterbi algorithm
+    int back_ptr[n_obs, n_states];     // Backpointers for state reconstruction
+    real best_logp[n_obs, n_states];   // Log probabilities for best paths
 
-    // ===== Forward Pass =====
+    //-------------------------------------------------------------------------
+    // Forward Pass: Calculate best paths and store backpointers
+    //-------------------------------------------------------------------------
     for (t in 1:n_obs) {
-      // Compute best_logp for each state at current timestep
+      // Calculate best_logp for each state at current timestep
       for (state in 1:n_states) {
         // Handle missing data case
         if (l[t] == -99) {
-          best_logp[t, state] = -log(n_states);  // uniform distribution
-          back_ptr[t, state] = 0;                // no meaningful backpointer
+          // Use uniform distribution for missing data
+          best_logp[t, state] = -log(n_states);
+          back_ptr[t, state] = 0;  // No meaningful backpointer
         } else {
           // Start of new track or first observation
           if (t == 1 || trk[t] != trk[t - 1]) {
-            best_logp[t, state] = -log(n_states);  // uniform initial distribution
+            // Initialize with uniform state distribution
+            best_logp[t, state] = -log(n_states);
             back_ptr[t, state] = 0;
             // Add emission probability for step length
-            best_logp[t, state] += gamma_lpdf(l[t] | l_shape[smp[t],state], l_rate[smp[t],state]);
+            best_logp[t, state] += gamma_lpdf(l[t] | l_shape[smp[t],state], 
+                                                    l_rate[smp[t],state]);
           } else {
-            // Initialize for finding best previous state
+            // Initialize variables for finding best previous state
             best_logp[t, state] = negative_infinity();
             back_ptr[t, state] = 0;
 
@@ -520,20 +646,25 @@ generated quantities {
             for (j in min_prev_state:max_prev_state) {
               if (l[t - 1] != -99 && trk[t] == trk[t - 1]) {
                 real logp = best_logp[t - 1, j];
+                
                 // Add transition probability
                 logp += log_gamma[t][j, state];
+                
                 // Add emission probability for step length
-                logp += gamma_lpdf(l[t] | l_shape[smp[t],state], l_rate[smp[t],state]);
+                logp += gamma_lpdf(l[t] | l_shape[smp[t],state], 
+                                        l_rate[smp[t],state]);
+                
                 // Add emission probability for angle if available
-                if (a[t]!=-99 && a[t-1]!=-99) {
+                if (a[t] != -99 && a[t-1] != -99) {
                   logp += angle_log_lik(
                     a[t], a[t-1], angle_type[t], edge_a[t], 
-                    cliff_l[t],  6, -1, 
+                    cliff_l[t], cliff_x, cliff_beta, 
                     edge_l[t], edge_x[smp[t]], edge_beta[smp[t]], 
-                    (30-edge_l[t]),  center_x[smp[t]], center_beta[smp[t]], 
+                    (30-edge_l[t]), center_x[smp[t]], center_beta[smp[t]], 
                     a_rho[smp[t],state], cliff_rho[smp[t],state], 
                     edge_rho[smp[t],state], center_rho[smp[t],state]);
                 }
+                
                 // Update if this path is better
                 if (logp > best_logp[t, state]) {
                   back_ptr[t, state] = j;
@@ -546,17 +677,23 @@ generated quantities {
       }
     }
 
-    // ===== Backward Pass =====
+    //-------------------------------------------------------------------------
+    // Backward Pass: Reconstruct most likely state sequence
+    //-------------------------------------------------------------------------
     {
       // Find best final state
       real max_logp = negative_infinity();
       int best_last_state = 1;
+      
+      // Search over final states
       for (state in 1:n_states) {
         if (best_logp[n_obs, state] > max_logp) {
           max_logp = best_logp[n_obs, state];
           best_last_state = state;
         }
       }
+      
+      // Set final state and log probability
       z_star[n_obs] = best_last_state;
       logp_z_star = max_logp;
 
@@ -567,7 +704,8 @@ generated quantities {
         int prev_state = back_ptr[t, current_state];
 
         if (prev_state == 0 || trk[t] != trk[t - 1]) {
-          // Start of track or no valid previous state
+          // Handle track boundaries or missing data
+          // Find best state at previous timestep
           real max_prev_logp = negative_infinity();
           int best_prev_state = 1;
           for (state in 1:n_states) {
@@ -578,28 +716,32 @@ generated quantities {
           }
           z_star[t - 1] = best_prev_state;
         } else {
+          // Normal case: use backpointer
           z_star[t - 1] = prev_state;
         }
         t -= 1;
       }
     }
 
-    // ===== Calculate Observation-wise Log-likelihood =====
+    //-------------------------------------------------------------------------
+    // Calculate Observation-wise Log Likelihoods
+    //-------------------------------------------------------------------------
     for (t in 1:n_obs) {
       int state = z_star[t];
       log_lik[t] = 0;
       
       // Step length log-likelihood
       if (l[t] != -99)
-        log_lik[t] += gamma_lpdf(l[t] | l_shape[smp[t],state], l_rate[smp[t],state]);
+        log_lik[t] += gamma_lpdf(l[t] | l_shape[smp[t],state], 
+                                      l_rate[smp[t],state]);
       
-      // Angle log-likelihood
+      // Angle log-likelihood for consecutive observations
       if (t >= 2 && trk[t] == trk[t - 1] && a[t] != -99 && a[t - 1] != -99) {
         log_lik[t] += angle_log_lik(
           a[t], a[t-1], angle_type[t], edge_a[t], 
-          cliff_l[t],  6, -1, 
+          cliff_l[t], cliff_x, cliff_beta, 
           edge_l[t], edge_x[smp[t]], edge_beta[smp[t]], 
-          (30-edge_l[t]),  center_x[smp[t]], center_beta[smp[t]], 
+          (30-edge_l[t]), center_x[smp[t]], center_beta[smp[t]], 
           a_rho[smp[t],state], cliff_rho[smp[t],state], 
           edge_rho[smp[t],state], center_rho[smp[t],state]);
       }
@@ -607,6 +749,7 @@ generated quantities {
       // Transition log-likelihood
       if (t >= 2 && trk[t] == trk[t - 1] && l[t] != -99) {
         int prev_state = z_star[t - 1];
+        // Only add transition probability if states are neighbors
         if (abs(prev_state - state) <= 1) {
           log_lik[t] += log_gamma[t][prev_state, state];
         } else {
