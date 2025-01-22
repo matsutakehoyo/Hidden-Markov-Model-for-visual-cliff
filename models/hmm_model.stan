@@ -2,17 +2,12 @@
 Hierarchical Hidden Markov Model for Visual Cliff Behavior Analysis
 ===============================================================
 
-This Stan model implements a hierarchical 3-state Hidden Markov Model (HMM) to analyze 
-rodent movement patterns in visual cliff experiments. The model characterizes discrete 
-behavioral states and their transitions in response to environmental features.
+This Stan model implements a hierarchical n-state Hidden Markov Model (HMM) to analyze 
+animal movement patterns in visual cliff experiments. The model characterizes discrete 
+behavioral states and their transitions in response to environmental features (edge, cliff, and center).
 
 Model Structure
 --------------
-- Three behavioral states representing different movement patterns:
-  1. Resting: minimal movement, high angular variance
-  2. Exploring: moderate speed with varied turning
-  3. Navigating: directed movement with low angular variance
-
 - Hierarchical organization with three levels:
   * Group level (experimental conditions)
   * Individual level (trials/samples)
@@ -28,7 +23,7 @@ Key Features
 2. Movement Parameters:
    - Step lengths: Gamma distribution with state-specific parameters
    - Turning angles: Wrapped Cauchy distribution with dynamic concentration
-   - Minimum separation between state means to ensure identifiability
+   - Minimum separation between state means to avoid state collapse
 
 3. Environmental Influences:
    - Edge effects: wall-following behavior
