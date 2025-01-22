@@ -1,54 +1,92 @@
 /*
 Hierarchical Hidden Markov Model for Visual Cliff Behavior Analysis
+===============================================================
 
-This Stan model implements a n-state HMM to analyze mouse movement data from visual cliff experiments.
-The model identifies and characterizes discrete behavioral states and their transitions in response 
-to visual stimuli and environmental features.
+This Stan model implements a hierarchical 3-state Hidden Markov Model (HMM) to analyze 
+rodent movement patterns in visual cliff experiments. The model characterizes discrete 
+behavioral states and their transitions in response to environmental features.
 
-Key Features:
-- Three behavioral states (Resting, Exploring, Navigating)
-- Structured transition matrix allowing only neighboring state transitions
-- Hierarchical structure for individual and group-level parameters
-- Regularization via horseshoe priors for transition coefficients
-- Spatial influences modeled through sigmoid-transformed covariates
+Model Structure
+--------------
+- Three behavioral states representing different movement patterns:
+  1. Resting: minimal movement, high angular variance
+  2. Exploring: moderate speed with varied turning
+  3. Navigating: directed movement with low angular variance
 
-Movement Modeling:
-- Step lengths: Gamma distribution with state-specific parameters
-- Angular changes: Wrapped Cauchy distribution with dynamically adjusted concentration
-- Environmental effects: Edge, cliff, and center influences modeled via sigmoid functions
+- Hierarchical organization with three levels:
+  * Group level (experimental conditions)
+  * Individual level (trials/samples)
+  * Observation level (movement data)
 
-Hierarchical Structure:
-- Group level (experimental conditions)
-- Sample level (individual trials)
-- Observation level (movement data)
+Key Features
+-----------
+1. State Transitions:
+   - Structured transition matrix allowing only neighboring state transitions
+   - Environmental effects modeled through sigmoid-transformed covariates
+   - Horseshoe prior for transition coefficients to handle sparsity
 
-Data Structure:
-- n_states: number of behavioral states (3)
-- n_obs: total number of observations
-- n_trk: number of tracks (continuous movement sequences)
-- n_smp: number of samples/trials
-- n_grp: number of experimental groups
-- l: step lengths
-- a: angles
-- edge_l, edge_a: distances and angles to edge
-- cliff_l: distance to cliff
-- cov: environmental covariates matrix [intercept, cliff, edge, center]
+2. Movement Parameters:
+   - Step lengths: Gamma distribution with state-specific parameters
+   - Turning angles: Wrapped Cauchy distribution with dynamic concentration
+   - Minimum separation between state means to ensure identifiability
+
+3. Environmental Influences:
+   - Edge effects: wall-following behavior
+   - Cliff effects: avoidance/approach patterns
+   - Center effects: open field behavior
+   - Each effect modeled via sigmoid functions with learned thresholds
+
+Input Data Structure
+------------------
+n_states : int
+    Number of behavioral states (fixed at 3)
+n_obs : int
+    Total number of observations across all tracks
+n_trk : int
+    Number of continuous movement tracks
+n_smp : int
+    Number of individual trials/samples
+n_grp : int
+    Number of experimental groups
+l : vector[n_obs]
+    Step lengths (-99 for missing data)
+a : vector[n_obs]
+    Turning angles in radians (-99 for missing data)
+edge_l : vector[n_obs]
+    Distance to nearest edge
+edge_a : vector[n_obs]
+    Angle to nearest edge
+cliff_l : vector[n_obs]
+    Distance to cliff edge
+cov : matrix[n_obs, 1+n_cov]
+    Environmental covariates [intercept, cliff, edge, center]
 
 Author: Take Matsuyama
 Date: December 2024
+License: MIT
 */
 
 functions {
   /*
-  Wrapped Cauchy log likelihood function
+  Compute log likelihood for wrapped Cauchy distribution
   
-  Computes the log likelihood of an angle under the wrapped Cauchy distribution.
-  Uses a numerically stable formulation to avoid potential underflow/overflow.
+  The wrapped Cauchy distribution is used for modeling angular data with varying
+  concentration around a mean direction. This implementation uses a numerically
+  stable formulation to prevent underflow/overflow.
   
-  Args:
-    y: observed angle (-π to π)
-    mu: mean/location parameter (-π to π)
-    rho: concentration parameter (0 to 1)
+  Parameters
+  ----------
+  y : real
+      Observed angle in radians (-π to π)
+  mu : real
+      Mean/location parameter (-π to π)
+  rho : real
+      Concentration parameter (0 to 1), higher values = more concentrated
+  
+  Returns
+  -------
+  real
+      Log likelihood value
   */
   real wcauchy_log_lik(real y, real mu, real rho) {
       real denom = 1 + rho^2 - 2 * rho * cos(y - mu);
@@ -59,33 +97,41 @@ functions {
   /*
   Compute log transition probability matrix
   
-  Calculates the structured TPM allowing only neighboring state transitions.
-  Uses softmax to ensure proper probability normalization for each row.
+  Calculates structured transition probabilities between states, allowing only
+  transitions between neighboring states. Uses softmax for proper probability
+  normalization.
   
-  Args:
-    n_states: number of states (3)
-    beta_row: matrix of regression coefficients
-    cov_vec: vector of covariates
-  Returns:
-    log_gamma: matrix of log transition probabilities
+  Parameters
+  ----------
+  n_states : int
+      Number of states (3)
+  beta_row : matrix
+      Matrix of regression coefficients for transitions
+  cov_vec : vector
+      Vector of environmental covariates
+  
+  Returns
+  -------
+  matrix
+      Log transition probability matrix
   */
   matrix compute_log_gamma(int n_states, matrix beta_row, vector cov_vec) {
     matrix[n_states, n_states] log_gamma;
     int index = 1;
 
-    // Compute unnormalized log transition probabilities
+    // Compute unnormalized log probabilities
     for(i in 1:n_states) { 
       for(j in 1:n_states) {
-        if(abs(i-j) <= 1) { //self and adjacent transitions
+        if(abs(i-j) <= 1) {  // Allow only self and adjacent transitions
           log_gamma[i,j] = beta_row[index,] * cov_vec;
           index += 1;
         } else {
-          log_gamma[i,j] = negative_infinity();  // Non-adjacent transitions
+          log_gamma[i,j] = negative_infinity();
         }
       }
     }
 
-    // Normalize each row using log_softmax
+    // Row-wise normalization
     for (i in 1:n_states) {
       log_gamma[i, ] = (log_softmax(to_vector(log_gamma[i, ]')))';
     }
@@ -96,19 +142,35 @@ functions {
   /*
   Compute angle log likelihood with environmental influences
   
-  Calculates the log likelihood of an angle considering edge, cliff, and center effects.
-  Modifies both the expected angle (lambda) and concentration (rho) based on spatial features.
+  Calculates the log likelihood of an observed angle considering multiple
+  environmental effects (edge, cliff, center). Both the expected angle and
+  concentration parameter are modified based on spatial features.
   
-  Args:
-    a_t: current angle
-    a_t_minus_1: previous angle
-    angle_type: movement direction (1: clockwise, 2: counterclockwise)
-    edge_a: angle to nearest edge
-    cliff_l, edge_l: distances to cliff and edge
-    cliff_x, edge_x, center_x: influence thresholds
-    cliff_beta, edge_beta, center_beta: influence slopes
-    a_rho: base concentration
-    cliff_rho, edge_rho, center_rho: feature-specific concentrations
+  Parameters
+  ----------
+  a_t : real
+      Current angle
+  a_t_minus_1 : real
+      Previous angle
+  angle_type : int
+      Movement direction (1: clockwise, 2: counterclockwise)
+  edge_a : real
+      Angle to nearest edge
+  cliff_l, edge_l : real
+      Distances to cliff and edge
+  cliff_x, edge_x, center_x : real
+      Influence thresholds
+  cliff_beta, edge_beta, center_beta : real
+      Influence slopes
+  a_rho : real
+      Base angular concentration
+  cliff_rho, edge_rho, center_rho : real
+      Feature-specific concentrations
+  
+  Returns
+  -------
+  real
+      Log likelihood value
   */
   real angle_log_lik(
       real a_t,
@@ -128,32 +190,29 @@ functions {
       real cliff_rho, 
       real edge_rho,
       real center_rho) {
-    // Calculate feature influences using sigmoid transformations
+    // Calculate environmental effects using sigmoid functions
     real cliff_effect = inv_logit((cliff_l - cliff_x) * cliff_beta);
     real edge_effect = inv_logit((edge_l - edge_x) * edge_beta);
     real center_effect = inv_logit(((30-edge_l) - center_x) * center_beta);
 
-    // Calculate expected angle (lambda) considering edge effect
+    // Calculate expected angle based on edge following behavior
     real lambda;
     if (angle_type == 1) {
         lambda = (1 - edge_effect) * a_t_minus_1 + edge_effect * (edge_a + pi() / 2);
     } else {
         lambda = (1 - edge_effect) * a_t_minus_1 + edge_effect * (edge_a - pi() / 2);
     }
-    // Wrap lambda to [-π, π]
+    // Ensure angle stays in [-π, π]
     lambda = atan2(sin(lambda), cos(lambda));
 
     // Calculate weighted concentration parameter
-    real rho = (a_rho + cliff_effect * cliff_rho + edge_effect * edge_rho + center_effect * center_rho) / 
+    real rho = (a_rho + cliff_effect * cliff_rho + edge_effect * edge_rho + 
+                center_effect * center_rho) / 
                (1 + edge_effect + cliff_effect + center_effect);
 
-    // Return log likelihood under wrapped Cauchy distribution
     return wcauchy_log_lik(a_t, lambda, rho);
   }
 }
-
-
-*/
 data {
   // Dimensions
   int<lower=1> n_states;          // number of states (3)
