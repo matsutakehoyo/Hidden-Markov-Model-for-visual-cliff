@@ -216,7 +216,7 @@ data {
   //=============================================================================
   
   // Core dimensions
-  int<lower=1> n_states;     // Number of behavioral states (fixed at 3)
+  int<lower=1> n_states;     // Number of behavioral states
   int<lower=1> n_obs;        // Total number of observations
   int<lower=1> n_trk;        // Number of continuous movement tracks
   int<lower=1> n_smp;        // Number of samples/trials
